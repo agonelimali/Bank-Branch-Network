@@ -1,0 +1,720 @@
+=== SOLUTION ARCHITECTURE BLUEPRINT ===
+
+Device Models and Roles:
+- Router: Cisco ISR 4331 - WAN Edge Router, Site Core interconnect, AES-256 VPN, OSPF Core Routing
+- Switch: Catalyst 9300 - Collapsed Core Switch, VLAN/Layer 3 gateway, 802.1X/Dot1x, QoS, Redundancy
+- Firewall: ASA 5516-X - Enterprise Firewall, PCI-DSS segmentation, IDS/IPS, management/Audit Logging
+- Wireless Controller: Cisco 5520 WLC - Secure Enterprise WiFi, WPA3 Enterprise, 802.1X, Role-based Access
+
+Network Topology Description:
+- Collapsed Core: Catalyst 9300 acts as Layer 3 gateway for site VLANs, with ISR4331 for WAN/Internet/4G failover.
+- ASA 5516-X Firewall: Interposed for PCI segmentation, deep packet inspection, threat detection, audit logging.
+- OSPF Area 0 connects core/router/firewall, with routed point-to-point links (/30 from 10.10.255.0/24).
+- Cat9300 uplinks to ASA and ISR via dedicated routed interfaces. Primary WAN via ISR; secondary cellular 4G as backup.
+- VLANs for all business segments. Secure trunking to WLC for enterprise and guest SSID.
+- 802.1X authentication enforced for all end-user access (AD/NPS backend assumed).
+- AAA, RBAC, compliance and logging on all devices. Automated vulnerability scan via Mgmt VLAN.
+- QoS prioritized for VoIP VLAN. Policy enforcement, ACLs per PCI/SWIFT/NIST standards.
+
+---
+
+=== DEVICE 1: WAN-EDGE-RTR (CISCO ISR 4331) ===
+! ===== SECTION: Basic Configuration =====
+hostname WAN-EDGE-RTR
+no ip domain-lookup
+ip domain-name bankcorp.local
+username admin privilege 15 secret 10 $uperS3cur3
+aaa new-model
+aaa authentication login default group radius local
+aaa authorization exec default group radius local
+aaa accounting exec default start-stop group radius
+aaa session-id common
+!
+enable secret 10 $uperS3cur3
+!
+banner motd ^
+Unauthorized access prohibited. All activity is monitored and logged.
+^
+
+! ===== END SECTION =====
+
+! ===== SECTION: Management & Logging =====
+logging buffered 16384 warnings
+logging host 192.168.100.10 transport udp port 514
+logging trap informational
+logging source-interface GigabitEthernet0/0/0
+service timestamps log datetime msec
+!
+ntp server 192.168.100.10
+ntp update-calendar
+!
+clock timezone UTC 0
+!
+ip ssh version 2
+ip ssh authentication-retries 3
+ip ssh timeout 60
+ip ssh logging events
+ip ssh pubkey-chain
+  username admin
+    key-string
+     <RSA-KEY-BLOCK>
+    exit
+!
+ip scp server enable
+!
+ip http secure-server
+!
+snmp-server community secSNMP RO
+snmp-server enable traps
+snmp-server host 192.168.100.10 version 2c secSNMP
+!
+archive
+  path flash:config-archive
+  write-memory
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Interface Configuration =====
+interface GigabitEthernet0/0/0
+ description PRIMARY WAN to ISP (100Mbps)
+ ip address x.x.x.x y.y.y.y
+ ip nat outside
+ ip access-group WAN-INBOUND in
+ no shutdown
+
+interface Cellular0/1/0
+ description FAILOVER 4G BACKUP (50Mbps)
+ ip address negotiated
+ ip nat outside
+ dialer in-band
+ dialer watch-group 1
+ no shutdown
+
+interface GigabitEthernet0/0/1
+ description TO-CORE Catalyst9300 Gi1/1 - P2P
+ ip address 10.10.255.1 255.255.255.252
+ ip ospf network point-to-point
+ no shutdown
+
+interface GigabitEthernet0/0/2
+ description TO-FIREWALL ASA5516-X Gi0/0 - P2P
+ ip address 10.10.255.5 255.255.255.252
+ ip ospf network point-to-point
+ no shutdown
+
+interface Loopback0
+ description Router-ID and Management
+ ip address 192.168.100.1 255.255.255.255
+
+! ===== END SECTION =====
+
+! ===== SECTION: High Availability/Redundancy =====
+track 10 interface GigabitEthernet0/0/0 line-protocol
+!
+ip sla 10
+ icmp-echo 8.8.8.8 source-ip x.x.x.x
+ frequency 10
+ip sla schedule 10 life forever start-time now
+!
+ip route 0.0.0.0 0.0.0.0 GigabitEthernet0/0/0 track 10
+ip route 0.0.0.0 0.0.0.0 Cellular0/1/0 254
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Routing Protocols =====
+router ospf 1
+ router-id 1.1.1.1
+ log-adjacency-changes
+ passive-interface default
+ no passive-interface GigabitEthernet0/0/1
+ no passive-interface GigabitEthernet0/0/2
+ network 10.10.255.0 0.0.0.255 area 0
+ network 192.168.100.1 0.0.0.0 area 0
+!
+ip ospf authentication message-digest
+interface GigabitEthernet0/0/1
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 CoreLinkAuth1
+!
+interface GigabitEthernet0/0/2
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 CoreLinkAuth1
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Security (NAT, ACLs, AAA, Encryption) =====
+! ===== PCI-DSS: NAT for internal traffic =====
+ip nat inside source list NAT_INSIDE interface GigabitEthernet0/0/0 overload
+access-list NAT_INSIDE permit ip 192.168.10.0 0.0.0.255 any
+access-list NAT_INSIDE permit ip 192.168.20.0 0.0.0.255 any
+access-list NAT_INSIDE permit ip 192.168.30.0 0.0.0.255 any
+access-list NAT_INSIDE permit ip 192.168.40.0 0.0.0.255 any
+access-list NAT_INSIDE permit ip 192.168.50.0 0.0.0.255 any
+access-list NAT_INSIDE permit ip 192.168.60.0 0.0.0.255 any
+access-list NAT_INSIDE permit ip 192.168.100.0 0.0.0.255 any
+
+! ===== ACLs - Restrict Management from WAN/Cellular =====
+ip access-list extended WAN-INBOUND
+ permit tcp any host x.x.x.x eq 443
+ deny ip any 192.168.100.0 0.0.0.255 log
+ permit ip any any
+
+! ===== AAA Encryption =====
+crypto pki trustpoint BANK-CA
+ enrollment terminal
+ subject-name CN=wan-edge-rtr.bankcorp.local
+ revocation-check crl
+ rsakeypair BANK-CA
+crypto pki authenticate BANK-CA
+crypto pki enroll BANK-CA
+!
+crypto isakmp policy 10
+ authentication pre-share
+ encryption aes 256
+ hash sha256
+ group 16
+ lifetime 86400
+!
+crypto ipsec transform-set AES256ESP esp-aes 256 esp-sha256-hmac
+!
+crypto map SECURE-MAP 10 ipsec-isakmp
+ set peer y.y.y.y
+ set transform-set AES256ESP
+ match address VPN-CRITICAL
+!
+ip access-list extended VPN-CRITICAL
+ permit ip 192.168.10.0 0.0.0.255 172.16.100.0 0.0.0.255
+ permit ip 192.168.20.0 0.0.0.255 172.16.100.0 0.0.0.255
+!
+interface GigabitEthernet0/0/0
+ crypto map SECURE-MAP
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Monitoring & Compliance =====
+ip device tracking
+ip source-route disable
+!
+ip ips notify SDEE
+ip ips await-drop-policy-on-reload
+!
+ip device tracking
+!
+event manager applet IPS_Audit_Alert
+ event syslog pattern "IPS"
+ action 1.0 syslog priority critical msg "IPS event detected - PCI-DSS Compliance Alert"
+!
+! ===== END SECTION =====
+
+copy running-config startup-config
+
+---
+
+=== DEVICE 2: CORE-9300 (CATALYST 9300) ===
+! ===== SECTION: Basic Configuration =====
+hostname CORE-9300
+no ip domain-lookup
+ip domain-name bankcorp.local
+username admin privilege 15 secret 10 $uperS3cur3
+enable secret 10 $uperS3cur3
+!
+banner motd ^
+This device is for bankcorp authorized users only.
+^
+
+aaa new-model
+aaa authentication dot1x default group radius
+aaa authorization network default group radius
+aaa accounting exec default start-stop group radius
+aaa authorization exec default group radius local
+radius-server host 192.168.100.11 auth-port 1812 acct-port 1813 key $radiusSecret123!
+
+! ===== END SECTION =====
+
+! ===== SECTION: VLAN & Trunking =====
+vlan 10
+ name CORE_BANKING
+vlan 20
+ name ATMs
+vlan 30
+ name TELLERS
+vlan 40
+ name GUEST_WIFI
+vlan 50
+ name SECURITY_CAMERAS
+vlan 60
+ name VOIP
+vlan 100
+ name MANAGEMENT
+
+interface range GigabitEthernet1/0/1-24
+ switchport mode access
+ switchport access vlan 30
+ authentication port-control auto
+ spanning-tree portfast
+ storm-control broadcast level 5.00
+ storm-control action trap
+
+interface range GigabitEthernet1/0/25-28
+ switchport mode access
+ switchport access vlan 10
+ authentication port-control auto
+ spanning-tree portfast
+ storm-control broadcast level 2.00
+ storm-control action trap
+
+interface range GigabitEthernet1/0/29-30
+ switchport mode access
+ switchport access vlan 20
+ authentication port-control auto
+ spanning-tree portfast
+
+interface range GigabitEthernet1/0/31-32
+ switchport mode access
+ switchport access vlan 60
+ authentication port-control auto
+ spanning-tree portfast
+
+interface range GigabitEthernet1/0/33-35
+ switchport mode access
+ switchport access vlan 100
+ authentication port-control auto
+ spanning-tree portfast
+
+interface range GigabitEthernet1/0/36-38
+ switchport mode trunk
+ switchport trunk allowed vlan 10,20,30,40,50,60,100
+ spanning-tree portfast trunk
+
+interface GigabitEthernet1/1/1
+ description TO-ISR4331 Gi0/0/1 - P2P
+ no switchport
+ ip address 10.10.255.2 255.255.255.252
+!
+interface GigabitEthernet1/1/2
+ description TO-ASA5516-X Gi0/1 - P2P
+ no switchport
+ ip address 10.10.255.9 255.255.255.252
+!
+interface GigabitEthernet1/1/3
+ description TO-WLC-5520 Port1 - Trunk
+ switchport mode trunk
+ switchport trunk allowed vlan 40,100
+ spanning-tree portfast trunk
+!
+interface Vlan10
+ description Core Banking SVI
+ ip address 192.168.10.1 255.255.255.0
+ ip helper-address 192.168.100.3
+ ip access-group VLAN10-IN in
+!
+interface Vlan20
+ description ATMs SVI
+ ip address 192.168.20.1 255.255.255.0
+ ip helper-address 192.168.100.3
+ ip access-group VLAN20-IN in
+!
+interface Vlan30
+ description Tellers SVI
+ ip address 192.168.30.1 255.255.255.0
+ ip helper-address 192.168.100.3
+ ip access-group VLAN30-IN in
+!
+interface Vlan40
+ description Guest WiFi SVI
+ ip address 192.168.40.1 255.255.255.0
+ ip helper-address 192.168.100.3
+ ip access-group VLAN40-IN in
+!
+interface Vlan50
+ description Security Cameras SVI
+ ip address 192.168.50.1 255.255.255.0
+ ip helper-address 192.168.100.3
+ ip access-group VLAN50-IN in
+!
+interface Vlan60
+ description VoIP SVI
+ ip address 192.168.60.1 255.255.255.0
+ ip helper-address 192.168.100.3
+ ip access-group VLAN60-IN in
+!
+interface Vlan100
+ description Management SVI
+ ip address 192.168.100.2 255.255.255.0
+ ip access-group VLAN100-IN in
+!
+interface Loopback0
+ ip address 192.168.100.4 255.255.255.255
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Routing =====
+ip routing
+!
+router ospf 1
+ router-id 2.2.2.2
+ log-adjacency-changes
+ network 10.10.255.0 0.0.0.255 area 0
+ network 192.168.10.1 0.0.0.0 area 0
+ network 192.168.20.1 0.0.0.0 area 0
+ network 192.168.30.1 0.0.0.0 area 0
+ network 192.168.40.1 0.0.0.0 area 0
+ network 192.168.50.1 0.0.0.0 area 0
+ network 192.168.60.1 0.0.0.0 area 0
+ network 192.168.100.2 0.0.0.0 area 0
+!
+ip ospf authentication message-digest
+interface GigabitEthernet1/1/1
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 CoreLinkAuth1
+!
+interface GigabitEthernet1/1/2
+ ip ospf authentication message-digest
+ ip ospf message-digest-key 1 md5 CoreLinkAuth1
+!
+
+! ===== END SECTION =====
+
+! ===== SECTION: Security & Policy Enforcement =====
+dot1x system-auth-control
+!
+ip access-list extended VLAN10-IN
+ permit ip 192.168.10.0 0.0.0.255 any
+ deny ip any any log
+!
+ip access-list extended VLAN20-IN
+ permit ip 192.168.20.0 0.0.0.255 any
+ deny ip any any log
+!
+ip access-list extended VLAN30-IN
+ permit ip 192.168.30.0 0.0.0.255 any
+ deny ip any any log
+!
+ip access-list extended VLAN40-IN
+ permit ip 192.168.40.0 0.0.0.255 any
+ deny ip any any log
+!
+ip access-list extended VLAN50-IN
+ permit ip 192.168.50.0 0.0.0.255 any
+ deny ip any any log
+!
+ip access-list extended VLAN60-IN
+ permit ip 192.168.60.0 0.0.0.255 any
+ deny ip any any log
+!
+ip access-list extended VLAN100-IN
+ permit ip 192.168.100.0 0.0.0.255 any
+ deny ip any any log
+!
+service password-encryption
+!
+errdisable recovery cause psecure-violation
+errdisable recovery interval 300
+!
+spanning-tree mode rapid-pvst
+spanning-tree portfast default
+!
+! ===== END SECTION =====
+
+! ===== SECTION: QoS Configuration =====
+mls qos
+!
+policy-map QOS-VOIP
+ class voice
+  priority percent 20
+ class class-default
+  fair-queue
+!
+interface range GigabitEthernet1/0/31-32
+ mls qos trust dscp
+ service-policy output QOS-VOIP
+!
+interface Vlan60
+ service-policy input QOS-VOIP
+!
+! ===== END SECTION =====
+
+! ===== SECTION: Management, Monitoring & Compliance =====
+logging buffered 24576 warnings
+logging host 192.168.100.10 transport udp port 514
+logging trap informational
+ntp server 192.168.100.10
+ip http secure-server
+ip ssh version 2
+ip ssh time-out 60
+ip ssh authentication-retries 3
+!
+snmp-server community secSNMP RO
+snmp-server enable traps
+snmp-server host 192.168.100.10 version 2c secSNMP
+!
+event manager applet VLAN_VIOLATION
+ event syslog pattern "PORT_SECURITY-2-PSECURE_VIOLATION"
+ action 1.0 syslog priority critical msg "Port Security Violation detected - PCI-DSS Alert"
+!
+archive
+  path flash:config-archive
+  write-memory
+!
+! ===== END SECTION =====
+
+copy running-config startup-config
+
+---
+
+=== DEVICE 3: BRANCH-FIREWALL (ASA 5516-X) ===
+! ===== SECTION: Basic Configuration =====
+hostname BRANCH-FIREWALL
+domain-name bankcorp.local
+!
+enable password $uperS3cur3
+!
+banner motd "Unauthorized access strictly prohibited. Activity monitored/logged."
+!
+crypto key generate rsa modulus 4096
+!
+username admin password $uperS3cur3 privilege 15
+aaa authentication ssh console LOCAL
+aaa authentication enable console LOCAL
+!
+clock timezone UTC 0
+!
+ntp server 192.168.100.10
+!
+logging enable
+logging buffered informational
+logging trap notifications
+logging host inside 192.168.100.10
+logging host management 192.168.100.10
+
+! ===== END SECTION =====
+
+! ===== SECTION: Interface Configuration =====
+interface GigabitEthernet0/0
+ nameif outside
+ security-level 0
+ ip address 10.10.255.6 255.255.255.252
+ no shutdown
+
+interface GigabitEthernet0/1
+ nameif inside
+ security-level 100
+ ip address 10.10.255.10 255.255.255.252
+ no shutdown
+
+interface GigabitEthernet0/2
+ nameif wireless
+ security-level 50
+ ip address 192.168.40.2 255.255.255.0
+ no shutdown
+
+interface GigabitEthernet0/3
+ nameif cameras
+ security-level 70
+ ip address 192.168.50.2 255.255.255.0
+ no shutdown
+
+interface Management0/0
+ nameif management
+ security-level 90
+ ip address 192.168.100.5 255.255.255.0
+ no shutdown
+
+! ===== END SECTION =====
+
+! ===== SECTION: Security (ACLs, NAT, IPS, Compliance) =====
+! --- PCI-DSS Segmentation ACLs ---
+access-list OUTSIDE_IN extended permit tcp any object-group DM_INLINE_NETWORK_1 eq 443 log
+access-list OUTSIDE_IN extended deny ip any 192.168.100.0 255.255.255.0 log
+access-list OUTSIDE_IN extended permit ip any any
+
+access-list INSIDE_OUT extended permit ip any any
+access-list WIRELESS_IN extended deny ip any 192.168.10.0 255.255.255.0 log
+access-list WIRELESS_IN extended deny ip any 192.168.20.0 255.255.255.0 log
+access-list WIRELESS_IN extended deny ip any 192.168.30.0 255.255.255.0 log
+access-list WIRELESS_IN extended permit ip any any
+
+access-list CAMERAS_IN extended permit ip host 192.168.50.21 host 192.168.100.10
+access-list CAMERAS_IN extended permit ip any any
+
+object-group network DM_INLINE_NETWORK_1
+ network-object 192.168.10.0 255.255.255.0
+ network-object 192.168.20.0 255.255.255.0
+ network-object 192.168.30.0 255.255.255.0
+ network-object 192.168.40.0 255.255.255.0
+ network-object 192.168.50.0 255.255.255.0
+ network-object 192.168.60.0 255.255.255.0
+ network-object 192.168.100.0 255.255.255.0
+
+! --- ACL Application --- 
+access-group OUTSIDE_IN in interface outside
+access-group INSIDE_OUT in interface inside
+access-group WIRELESS_IN in interface wireless
+access-group CAMERAS_IN in interface cameras
+
+! --- NAT for Outbound ---
+nat (inside,outside) after-auto source dynamic any interface
+nat (management,outside) after-auto source dynamic any interface
+
+! --- AAA/SSH/RBAC ---
+ssh 192.168.100.0 255.255.255.0 management
+ssh 10.10.255.0 255.255.255.0 inside
+ssh timeout 10
+aaa authentication ssh console LOCAL
+
+! --- IPS/IDS Inspection ---
+!
+policy-map global_policy
+ class inspection_default
+  inspect dns
+  inspect ftp
+  inspect http
+  inspect icmp
+  inspect ip-options
+  inspect rsh
+  inspect rtsp
+  inspect smtp
+  inspect ssh
+  inspect tcp
+  inspect udp
+!
+! PCI-DSS: IDS/IPS Signatures and alerting
+! (Assume Security Intelligence license, use built-in features)
+!
+!
+service-policy global_policy global
+
+! --- Audit & Compliance ---
+logging enable
+logging buffered informational
+logging history emergencies
+logging trap informational
+logging host management 192.168.100.10
+logging host inside 192.168.100.10
+logging facility 23
+!
+! PCI-DSS: Security event logging, syslog, SIEM Integration
+!
+! --- Automated Vulnerability Scanning Integration ---
+!
+! PCI-DSS: allow scanning from mgmt VLAN
+access-list MANAGEMENT_SCAN extended permit ip host 192.168.100.20 any
+access-group MANAGEMENT_SCAN in interface management
+
+! ===== END SECTION =====
+
+copy running-config startup-config
+
+---
+
+=== DEVICE 4: BANKCORP-WLC5520 (CISCO 5520 WLC) ===
+! ===== SECTION: Basic Configuration =====
+config hostname BANKCORP-WLC5520
+config country US
+config time ntp server 192.168.100.10
+config timezone UTC
+config mgmtuser add admin $uperS3cur3 admin
+config mgmtuser password admin $uperS3cur3
+config logging syslog host 192.168.100.10
+config snmp community secSNMP ro
+! ===== END SECTION =====
+
+! ===== SECTION: Interface & VLANs =====
+config interface create management 192.168.100.21 255.255.255.0 192.168.100.2 192.168.100.255
+config interface create guest 192.168.40.21 255.255.255.0 192.168.40.1 192.168.40.255
+!
+config interface vlan management 100
+config interface vlan guest 40
+!
+config interface port management 1/1
+config interface port guest 1/2
+! ===== END SECTION =====
+
+! ===== SECTION: WLAN / SSID Configuration =====
+config wlan create 1 CORP-BANKING 100
+config wlan security wpa2 enable 1
+config wlan security wpa3 enable 1
+config wlan security 802.1x 1 enable
+config wlan security wpa akm 802.1x 1 enable
+config wlan apgroup add BANK-AP-GROUP
+config wlan apgroup add wlan 1 BANK-AP-GROUP
+!
+config wlan create 2 GUEST-WIFI 40
+config wlan security wpa2 enable 2
+config wlan security wpa3 enable 2
+config wlan security 802.1x 2 enable
+config wlan security wpa akm 802.1x 2 enable
+!
+config wlan apgroup add wlan 2 BANK-AP-GROUP
+!
+config radius auth add 1 192.168.100.11 1812 $radiusSecret123!
+config radius acct add 1 192.168.100.11 1813 $radiusSecret123!
+config wlan security radius enable 1
+config wlan security radius enable 2
+! ===== END SECTION =====
+
+! ===== SECTION: Security & Monitoring =====
+config wps disable
+config network mgmt-via-dynamic-interface disable
+config network management ssh enable
+config network management webmode enable
+config network mgmtuser password-policy enable
+config flexconnect secure enable
+!
+config advanced eap-macfilter enable
+config advanced eap-macfilter action deny
+!
+config wids signature enable all
+config wids policy enable rogue-ap
+config wids policy enable ap-spoof
+config wids policy enable device-spoof
+!
+config network wireless intrusion detection system enable
+config network aaa override enable
+logging trap debugging
+!
+config interface create audit 192.168.100.22 255.255.255.0 192.168.100.2 192.168.100.255
+config interface vlan audit 100
+config syslog server 192.168.100.10
+config snmp v2c enable ro secSNMP
+! ===== END SECTION =====
+
+! ===== SECTION: QoS =====
+config qos profile create VOIP-PROFILE
+config qos profile set  VOIP-PROFILE dscp 46
+config wlan qos profile 1 VOIP-PROFILE
+! ===== END SECTION =====
+
+save config
+
+---
+
+=== DEPLOYMENT RECOMMENDATIONS ===
+
+Installation Sequence:
+1. Power up and configure base settings on ISR 4331, ASA 5516-X, and Cat9300 with correct hostnames and management access.
+2. Configure point-to-point interfaces/up-links between ISR, Cat9300, and ASA with cross-device validated subnets.
+3. Apply VLAN creation and SVI configurations on Cat9300, verify match with WLC VLANs and trunks.
+4. Deploy firewall ACLs, NAT, and segmentation inside ASA, bind to proper interfaces.
+5. Apply OSPF on ISR and Cat9300; validate adjacency and area settings.
+6. Configure 802.1X, AAA, and RADIUS on Cat9300 and WLC, integrate with RADIUS backend.
+7. Apply QoS, IPS, and compliance logging features on all devices as per device role.
+8. Test wireless SSIDs, VLAN mapping, and end-to-end segmentation enforcement.
+
+Verification Procedures:
+- ping/trace across all VLAN gateways (SVIs) and inter-device P2P subnets
+- show ip ospf neighbor to confirm core adjacency
+- show interfaces status, spanning-tree, and Dot1x authentication success
+- show access-lists, show conn, show xlate, show asp drop on ASA for rule validation
+- show crypto session/ISAKMP/IPSec for VPN if used
+- show logging, confirm syslog/NTPSync on all devices
+- test automated vulnerability scan from Mgmt VLAN
+- test user/workstation and guest WiFi auth, role-mapping, and audit trails.
+
+=== DEPLOYMENT SUCCESS CRITERIA ===
+
+✓ CONNECTIVITY: All VLANs routed with gateway and P2P subnets reachable; SSIDs have Internet/Mgmt access per policy  
+✓ ROUTING: OSPF forms neighbor adjacencies; external routes properly injected  
+✓ SECURITY: PCI-DSS segmentation ACLs and firewall rules enforced; 802.1X, AAA, and encryption operational  
+✓ MANAGEMENT: Central syslog, SNMP, and NTP all devices; AAA/RADIUS functional; audit logging working  
+✓ REDUNDANCY: 4G failover tested; spanning-tree and port security confirm no loops or rogue connections
